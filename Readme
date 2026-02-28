@@ -1,0 +1,313 @@
+# UAM IDS — Server Setup Guide
+
+## What This Server Does
+
+Think of this server as a **security control room**. Your agents (installed on employee computers) send data every 30 seconds. This server:
+
+1. **Receives** all that data
+2. **Stores** it in a database
+3. **Analyses** patterns over time (the correlation engine)
+4. **Raises alerts** when it finds suspicious behaviour (email/Slack/webhook)
+
+---
+
+## Files
+
+| File | Purpose |
+|---|---|
+| `server.py` | Main server — receives data from agents, answers API calls |
+| `correlator.py` | The "detective" — looks for multi-signal patterns over time |
+| `alerter.py` | Sends email/Slack/webhook alerts to your security team |
+| `models.py` | Database structure (tables, columns) |
+| `config.py` | All settings — read from environment variables |
+| `requirements.txt` | Python packages needed |
+
+---
+
+## Requirements
+
+- Python 3.10 or newer
+- A server (Windows Server, Ubuntu, or any cloud VM)
+- PostgreSQL 14+ (or SQLite for small setups)
+
+---
+
+## Quick Start (SQLite — easiest, for testing)
+
+```bash
+# 1. Install Python packages
+pip install -r requirements.txt
+
+# 2. Set minimum required environment variables
+set UAM_AGENT_APIKEY=MyAgentKey123        # Windows
+set UAM_ANALYST_APIKEY=MyAnalystKey456
+set UAM_HMAC_SECRET=MyHmacSecret789
+set UAM_SECRET_KEY=MyFlaskSecret000
+
+# Linux/macOS:
+export UAM_AGENT_APIKEY=MyAgentKey123
+export UAM_ANALYST_APIKEY=MyAnalystKey456
+export UAM_HMAC_SECRET=MyHmacSecret789
+export UAM_SECRET_KEY=MyFlaskSecret000
+
+# 3. Start the server
+python server.py
+```
+
+The server will start on http://0.0.0.0:5000 and create a local file `uam_ids.db` automatically.
+
+---
+
+## Production Setup (PostgreSQL)
+
+### Step 1 — Install PostgreSQL
+
+Ubuntu:
+```bash
+sudo apt install postgresql postgresql-contrib
+sudo systemctl start postgresql
+sudo systemctl enable postgresql
+```
+
+Windows: Download from https://www.postgresql.org/download/windows/
+
+### Step 2 — Create database
+
+```bash
+sudo -u postgres psql
+CREATE DATABASE uam_ids;
+CREATE USER uam_user WITH PASSWORD 'StrongPassword123';
+GRANT ALL PRIVILEGES ON DATABASE uam_ids TO uam_user;
+\q
+```
+
+### Step 3 — Set environment variables
+
+Create a file called `.env` and load it before starting:
+
+```env
+UAM_DB_URL=postgresql://uam_user:StrongPassword123@localhost:5432/uam_ids
+UAM_HOST=0.0.0.0
+UAM_PORT=5000
+UAM_SECRET_KEY=ChangeThisToSomethingRandom
+UAM_AGENT_APIKEY=ChangeThisAgentKey
+UAM_ANALYST_APIKEY=ChangeThisAnalystKey
+UAM_HMAC_SECRET=ChangeThisHmacSecret
+
+# Email alerts (Gmail example)
+UAM_EMAIL_ENABLED=true
+UAM_SMTP_HOST=smtp.gmail.com
+UAM_SMTP_PORT=587
+UAM_SMTP_USER=your-email@gmail.com
+UAM_SMTP_PASS=your-app-password
+UAM_SMTP_FROM=uam-ids@yourcompany.com
+UAM_ALERT_EMAIL_TO=security@yourcompany.com
+
+# Slack alerts (optional)
+UAM_SLACK_ENABLED=false
+UAM_SLACK_WEBHOOK=https://hooks.slack.com/services/YOUR/WEBHOOK/URL
+
+# Alert thresholds
+UAM_ALERT_MIN_SEVERITY=HIGH
+UAM_SCORE_CRITICAL=85
+UAM_SCORE_HIGH=70
+UAM_SCORE_MEDIUM=50
+```
+
+Load and run:
+```bash
+# Linux
+export $(cat .env | xargs)
+python server.py
+
+# Or use python-dotenv:
+pip install python-dotenv
+```
+
+### Step 4 — Run as a service (Linux systemd)
+
+Create `/etc/systemd/system/uam-ids.service`:
+
+```ini
+[Unit]
+Description=UAM IDS Server
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/uam_server
+EnvironmentFile=/opt/uam_server/.env
+ExecStart=/usr/bin/python3 /opt/uam_server/server.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable and start:
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable uam-ids
+sudo systemctl start uam-ids
+sudo systemctl status uam-ids
+```
+
+---
+
+## Connecting Agents
+
+On each monitored computer, set these environment variables before running the agent:
+
+```
+AGENT_SERVER=http://YOUR_SERVER_IP:5000/api/logs
+AGENT_APIKEY=ChangeThisAgentKey       ← must match UAM_AGENT_APIKEY
+AGENT_SECRET=ChangeThisHmacSecret     ← must match UAM_HMAC_SECRET
+```
+
+---
+
+## Analyst REST API
+
+All analyst endpoints require the header: `X-ANALYST-KEY: <your_analyst_key>`
+
+### Dashboard summary
+```
+GET /api/analyst/summary
+```
+Returns: total agents, active agents, open incidents, payloads in last 24h, top risky agents.
+
+### List agents
+```
+GET /api/analyst/agents?page=1&limit=50&search=username
+```
+
+### Get agent detail + risk trend
+```
+GET /api/analyst/agents/<agent_id>
+```
+
+### Get agent payloads (raw data)
+```
+GET /api/analyst/agents/<agent_id>/payloads?min_score=50&page=1
+```
+
+### List incidents
+```
+GET /api/analyst/incidents?status=OPEN&severity=HIGH
+```
+Status options: `OPEN`, `INVESTIGATING`, `CLOSED`, `FALSE_POSITIVE`
+Severity options: `LOW`, `MEDIUM`, `HIGH`, `CRITICAL`
+
+### Update incident (change status, add notes)
+```
+PATCH /api/analyst/incidents/<id>
+Body: { "status": "INVESTIGATING", "analyst_notes": "Reviewed — user on notice period." }
+```
+
+### Watchlist — add user for extra scrutiny
+```
+POST /api/analyst/watchlist
+Body: { "username": "jsmith", "reason": "On performance plan", "score_boost": 25 }
+```
+
+### Flag statistics (most common alerts)
+```
+GET /api/analyst/stats/flags?hours=24
+```
+
+### Risk timeline
+```
+GET /api/analyst/stats/risk_timeline?hours=24&agent_id=<optional>
+```
+
+### Manually trigger correlation
+```
+POST /api/analyst/correlate_now
+```
+
+---
+
+## Correlation Rules (Built-in)
+
+The correlation engine has 13 built-in rules. Each rule requires multiple signals before raising an incident:
+
+| Rule | Severity | What It Detects |
+|---|---|---|
+| R01 | CRITICAL | Sensitive file copied to USB + network upload |
+| R02 | CRITICAL | Impossible travel (two locations simultaneously) |
+| R03 | CRITICAL | C2 beaconing + credential theft |
+| R04 | HIGH | DNS tunneling data exfiltration |
+| R05 | HIGH | Bulk email exfiltration after hours |
+| R06 | HIGH | Privilege escalation + hacking tools |
+| R07 | MEDIUM | Repeated off-hours access (slow burn) |
+| R08 | HIGH | Large personal cloud upload |
+| R09 | HIGH | Credential theft attempt |
+| R10 | MEDIUM | Mass printing after hours |
+| R11 | HIGH | Bot/automated activity with large upload |
+| R12 | CRITICAL | Known malicious file detected |
+| R13 | MEDIUM | VPN after hours + large upload |
+
+---
+
+## Risk Scoring
+
+Every payload from an agent includes a **risk score (0–100)**. The server then adds a **correlation bonus** when multiple signals combine:
+
+- Agent score 85+ → CRITICAL
+- Agent score 70+ → HIGH  
+- Agent score 50+ → MEDIUM
+- Agent score 30+ → LOW
+
+Scores **decay** when an agent has clean check-ins (85% per 4 hours by default). This prevents old incidents from staying open forever.
+
+---
+
+## Alert Channels
+
+| Channel | Config variable | What to set |
+|---|---|---|
+| Email | UAM_EMAIL_ENABLED=true | SMTP settings |
+| Slack | UAM_SLACK_ENABLED=true | Webhook URL |
+| Webhook | UAM_WEBHOOK_ENABLED=true | URL (Teams, SIEM, etc.) |
+
+Only incidents at or above `UAM_ALERT_MIN_SEVERITY` (default: HIGH) trigger alerts.
+
+---
+
+## Firewall / Network
+
+The server listens on port **5000** by default. You need to:
+- Allow inbound TCP 5000 from agent machines
+- Block port 5000 from the internet (internal only)
+- Or put Nginx/Apache in front as a reverse proxy for HTTPS
+
+```bash
+# Ubuntu firewall example
+sudo ufw allow from 192.168.1.0/24 to any port 5000  # allow your office network
+sudo ufw deny 5000                                      # block everything else
+```
+
+---
+
+## Troubleshooting
+
+**Server won't start:**
+- Check Python version: `python --version` (need 3.10+)
+- Check all packages installed: `pip install -r requirements.txt`
+- Check DB URL is correct
+
+**Agents not connecting:**
+- Verify `AGENT_SERVER` points to correct IP and port
+- Verify `AGENT_APIKEY` matches `UAM_AGENT_APIKEY`
+- Check firewall allows port 5000
+
+**No incidents being created:**
+- Check correlator is running: look for "Correlation run" in `uam_server.log`
+- Agents may not have enough data yet (need a few minutes of check-ins)
+- Risk scores may be below thresholds — check `/api/analyst/agents`
+
+**Emails not sending:**
+- For Gmail: use an App Password (not your regular password)
+- Enable 2FA on Gmail first, then create App Password at myaccount.google.com
